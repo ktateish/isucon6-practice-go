@@ -86,6 +86,14 @@ func pathURIEscape(s string) string {
 	return (&url.URL{Path: s}).String()
 }
 
+func pathURIUnescape(s string) (string, error) {
+	res, err := url.Parse(s)
+	if err != nil {
+		logdbg("failed to url.Parse(%s): %v", s, err)
+	}
+	return res.Path, err
+}
+
 func notFound(w http.ResponseWriter) {
 	code := http.StatusNotFound
 	http.Error(w, http.StatusText(code), code)
