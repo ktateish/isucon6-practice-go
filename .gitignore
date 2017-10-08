@@ -1,4 +1,6 @@
 bin
+exp
+exp.go
 isuda
 isutar
 pkg/

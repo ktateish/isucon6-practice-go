@@ -1,4 +1,4 @@
-all: isuda isutar
+all: isuda isutar exp
 
 deps:
 	go get github.com/go-sql-driver/mysql
@@ -7,10 +7,21 @@ deps:
 	go get github.com/Songmu/strrand
 	go get github.com/unrolled/render
 
-isuda: deps
+isuda: isuda.go type.go util.go
 	go build -o isuda isuda.go type.go util.go
 
-isutar: deps
+isutar: isutar.go type.go util.go
 	go build -o isutar isutar.go type.go util.go
 
-.PHONY: all deps
+exp: exp.go
+	go build -o exp exp.go
+
+restart-isuda: isuda
+	sudo systemctl restart isuda.go
+
+restart-isutar: isutar
+	sudo systemctl restart isutar.go
+
+restart: restart-isuda restart-isutar
+
+.PHONY: all deps restart restart-isuda restart-isutar
