@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"github.com/Songmu/strrand"
+	"github.com/glenn-brown/golang-pkg-pcre/src/pkg/pcre"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
@@ -325,12 +326,12 @@ func htmlify(w http.ResponseWriter, r *http.Request, content string) string {
 	for _, entry := range entries {
 		keywords = append(keywords, regexp.QuoteMeta(entry.Keyword))
 	}
-	re := regexp.MustCompile("(" + strings.Join(keywords, "|") + ")")
+	reg := pcre.MustCompile("("+strings.Join(keywords, "|")+")", 0)
 	kw2sha := make(map[string]string)
-	content = re.ReplaceAllStringFunc(content, func(kw string) string {
+	content = reg.ReplaceAllStringFunc(content, func(kw string) string {
 		kw2sha[kw] = "isuda_" + fmt.Sprintf("%x", sha1.Sum([]byte(kw)))
 		return kw2sha[kw]
-	})
+	}, 0)
 	content = html.EscapeString(content)
 	for kw, hash := range kw2sha {
 		u, err := r.URL.Parse(baseUrl.String() + "/keyword/" + pathURIEscape(kw))
