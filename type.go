@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -15,6 +16,25 @@ type Entry struct {
 
 	Html  string
 	Stars []*Star
+
+	Mutex           *sync.RWMutex
+	MatchedKeywords []string
+}
+
+func (e *Entry) RLock() {
+	e.Mutex.RLock()
+}
+
+func (e *Entry) RUnlock() {
+	e.Mutex.RUnlock()
+}
+
+func (e *Entry) Lock() {
+	e.Mutex.Lock()
+}
+
+func (e *Entry) Unlock() {
+	e.Mutex.Unlock()
 }
 
 type User struct {

@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/Songmu/strrand"
 	"github.com/glenn-brown/golang-pkg-pcre/src/pkg/pcre"
@@ -32,6 +33,7 @@ const (
 )
 
 var (
+	entryCache     *EntryCache
 	isutarEndpoint string
 	isupamEndpoint string
 
@@ -42,6 +44,10 @@ var (
 
 	errInvalidUser = errors.New("Invalid User")
 )
+
+func init() {
+	entryCache = NewEntryCache()
+}
 
 func setName(w http.ResponseWriter, r *http.Request) error {
 	session := getSession(w, r)
@@ -78,6 +84,8 @@ func initializeHandler(w http.ResponseWriter, r *http.Request) {
 	panicIf(err)
 	defer resp.Body.Close()
 
+	go populateCache()
+
 	re.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
 }
 
@@ -95,7 +103,7 @@ func topHandler(w http.ResponseWriter, r *http.Request) {
 	page, _ := strconv.Atoi(p)
 
 	rows, err := db.Query(fmt.Sprintf(
-		"SELECT * FROM entry ORDER BY updated_at DESC LIMIT %d OFFSET %d",
+		"SELECT keyword FROM entry ORDER BY updated_at DESC LIMIT %d OFFSET %d",
 		perPage, perPage*(page-1),
 	))
 	if err != nil && err != sql.ErrNoRows {
@@ -103,10 +111,13 @@ func topHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	entries := make([]*Entry, 0, 10)
 	for rows.Next() {
-		e := Entry{}
-		err := rows.Scan(&e.ID, &e.AuthorID, &e.Keyword, &e.Description, &e.UpdatedAt, &e.CreatedAt)
+		var keyword string
+		err := rows.Scan(&keyword)
 		panicIf(err)
-		e.Html = htmlify(w, r, e.Description)
+		e, ok := loadEntry(keyword)
+		if !ok {
+			continue
+		}
 		e.Stars = loadStars(e.Keyword)
 		entries = append(entries, &e)
 	}
@@ -164,14 +175,10 @@ func keywordPostHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "SPAM!", http.StatusBadRequest)
 		return
 	}
-	_, err := db.Exec(`
-		INSERT INTO entry (author_id, keyword, description, created_at, updated_at)
-		VALUES (?, ?, ?, NOW(), NOW())
-		ON DUPLICATE KEY UPDATE
-		author_id = ?, keyword = ?, description = ?, updated_at = NOW()
-	`, userID, keyword, description, userID, keyword, description)
+	err := insertOrUpdateEntry(userID, keyword, description)
 	panicIf(err)
 	http.Redirect(w, r, "/", http.StatusFound)
+	//entryCache.Clear()
 }
 
 func loginHandler(w http.ResponseWriter, r *http.Request) {
@@ -259,14 +266,11 @@ func keywordByKeywordHandler(w http.ResponseWriter, r *http.Request) {
 	if uerr != nil {
 		panic(uerr)
 	}
-	row := db.QueryRow(`SELECT * FROM entry WHERE keyword = ?`, keyword)
-	e := Entry{}
-	err := row.Scan(&e.ID, &e.AuthorID, &e.Keyword, &e.Description, &e.UpdatedAt, &e.CreatedAt)
-	if err == sql.ErrNoRows {
+	e, ok := loadEntry(keyword)
+	if !ok {
 		notFound(w)
 		return
 	}
-	e.Html = htmlify(w, r, e.Description)
 	e.Stars = loadStars(e.Keyword)
 
 	re.HTML(w, http.StatusOK, "keyword", struct {
@@ -296,19 +300,16 @@ func keywordByKeywordDeleteHandler(w http.ResponseWriter, r *http.Request) {
 		badRequest(w)
 		return
 	}
-	row := db.QueryRow(`SELECT * FROM entry WHERE keyword = ?`, keyword)
-	e := Entry{}
-	err := row.Scan(&e.ID, &e.AuthorID, &e.Keyword, &e.Description, &e.UpdatedAt, &e.CreatedAt)
-	if err == sql.ErrNoRows {
+	ok, err := dropEntry(keyword)
+	panicIf(err)
+	if !ok {
 		notFound(w)
 		return
 	}
-	_, err = db.Exec(`DELETE FROM entry WHERE keyword = ?`, keyword)
-	panicIf(err)
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
-func htmlify(w http.ResponseWriter, r *http.Request, content string) string {
+func htmlify(content string) string {
 	if content == "" {
 		return ""
 	}
@@ -337,7 +338,7 @@ func htmlify(w http.ResponseWriter, r *http.Request, content string) string {
 	}, 0)
 	content = html.EscapeString(content)
 	for kw, hash := range kw2sha {
-		u, err := r.URL.Parse(baseUrl.String() + "/keyword/" + pathURIEscape(kw))
+		u, err := url.Parse(baseUrl.String() + "/keyword/" + pathURIEscape(kw))
 		panicIf(err)
 		link := fmt.Sprintf("<a href=\"%s\">%s</a>", u, html.EscapeString(kw))
 		content = strings.Replace(content, hash, link, -1)
@@ -481,4 +482,97 @@ func main() {
 
 	r.PathPrefix("/").Handler(http.FileServer(http.Dir("./public/")))
 	log.Fatal(http.ListenAndServe(":5000", r))
+}
+
+func populateCache() {
+	logdbg("populateCache: start")
+	rows, err := db.Query("SELECT keyword FROM entry")
+	if err != nil && err != sql.ErrNoRows {
+		panicIf(err)
+	}
+	for rows.Next() {
+		var keyword string
+		err := rows.Scan(&keyword)
+		panicIf(err)
+		loadEntry(keyword)
+	}
+	rows.Close()
+	logdbg("populateCache: done")
+}
+
+type EntryCache struct {
+	m   map[string]*Entry
+	mtx *sync.RWMutex
+}
+
+func NewEntryCache() *EntryCache {
+	return &EntryCache{
+		m:   make(map[string]*Entry),
+		mtx: &sync.RWMutex{},
+	}
+}
+
+func loadEntry(keyword string) (Entry, bool) {
+	e, ok := loadEntryPointer(keyword)
+	if !ok {
+		return Entry{}, false
+	}
+	return *e, ok
+}
+
+func loadEntryPointer(keyword string) (*Entry, bool) {
+	entryCache.mtx.RLock()
+	e, ok := entryCache.m[keyword]
+	entryCache.mtx.RUnlock()
+
+	if ok {
+		return e, true
+	}
+
+	entryCache.mtx.Lock()
+	e, ok = entryCache.m[keyword]
+	if ok {
+		entryCache.mtx.Unlock()
+		return e, ok
+	}
+
+	row := db.QueryRow(`SELECT * FROM entry WHERE keyword = ?`, keyword)
+	e = &Entry{}
+	e.Mutex = &sync.RWMutex{}
+	err := row.Scan(&e.ID, &e.AuthorID, &e.Keyword, &e.Description, &e.UpdatedAt, &e.CreatedAt)
+	if err == sql.ErrNoRows {
+		entryCache.mtx.Unlock()
+		return &Entry{}, false
+	}
+	e.Html = htmlify(e.Description)
+
+	entryCache.m[keyword] = e
+	entryCache.mtx.Unlock()
+	return e, true
+}
+
+func dropEntry(keyword string) (bool, error) {
+	entryCache.mtx.Lock()
+	_, ok := entryCache.m[keyword]
+	if !ok {
+		entryCache.mtx.Unlock()
+		return false, nil
+	}
+	delete(entryCache.m, keyword)
+	_, err := db.Exec(`DELETE FROM entry WHERE keyword = ?`, keyword)
+	entryCache.mtx.Unlock()
+	return true, err
+}
+
+func insertOrUpdateEntry(userID int, keyword, description string) error {
+	entryCache.mtx.Lock()
+	_, err := db.Exec(`
+		INSERT INTO entry (author_id, keyword, description, created_at, updated_at)
+		VALUES (?, ?, ?, NOW(), NOW())
+		ON DUPLICATE KEY UPDATE
+		author_id = ?, keyword = ?, description = ?, updated_at = NOW()
+	`, userID, keyword, description, userID, keyword, description)
+	delete(entryCache.m, keyword)
+	entryCache.mtx.Unlock()
+	return err
 }
