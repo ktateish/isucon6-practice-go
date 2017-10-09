@@ -14,13 +14,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/Songmu/strrand"
-	"github.com/glenn-brown/golang-pkg-pcre/src/pkg/pcre"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
@@ -33,7 +31,12 @@ const (
 )
 
 var (
-	entryCache     *EntryCache
+	entryCache *EntryCache
+	repl1      *strings.Replacer
+	repl2      *strings.Replacer
+	replver    int64
+	replmtx    *sync.RWMutex
+
 	isutarEndpoint string
 	isupamEndpoint string
 
@@ -45,8 +48,59 @@ var (
 	errInvalidUser = errors.New("Invalid User")
 )
 
+func getReplacers() (int64, *strings.Replacer, *strings.Replacer) {
+	replmtx.RLock()
+	ver := replver
+	r1 := repl1
+	r2 := repl2
+	replmtx.RUnlock()
+	return ver, r1, r2
+}
+
+func replacerRules() ([]string, []string) {
+	rows, err := db.Query(`
+		SELECT keyword FROM entry ORDER BY CHARACTER_LENGTH(keyword) DESC
+	`)
+	panicIf(err)
+	rule1 := make([]string, 0, 500)
+	rule2 := make([]string, 0, 500)
+	for rows.Next() {
+		var k string
+		err := rows.Scan(&k)
+		panicIf(err)
+		sha := "isuda_" + fmt.Sprintf("%x", sha1.Sum([]byte(k)))
+		u, err := url.Parse(baseUrl.String() + "/keyword/" + pathURIEscape(k))
+		panicIf(err)
+		link := fmt.Sprintf("<a href=\"%s\">%s</a>", u, html.EscapeString(k))
+		rule1 = append(rule1, k, sha)
+		rule2 = append(rule2, sha, link)
+	}
+	rule2 = append(rule2, "\n", "<br />\n")
+	rows.Close()
+	return rule1, rule2
+}
+
+func updateReplacers() {
+	replmtx.Lock()
+	rule1, rule2 := replacerRules()
+	replver++
+	repl1 = strings.NewReplacer(rule1...)
+	repl2 = strings.NewReplacer(rule2...)
+	replmtx.Unlock()
+}
+
+func initializeReplacers() {
+	replmtx.Lock()
+	rule1, rule2 := replacerRules()
+	replver++
+	repl1 = strings.NewReplacer(rule1...)
+	repl2 = strings.NewReplacer(rule2...)
+	replmtx.Unlock()
+}
+
 func init() {
 	entryCache = NewEntryCache()
+	replmtx = &sync.RWMutex{}
 }
 
 func setName(w http.ResponseWriter, r *http.Request) error {
@@ -85,6 +139,7 @@ func initializeHandler(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	go populateCache()
+	go initializeReplacers()
 
 	re.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
 }
@@ -118,8 +173,10 @@ func topHandler(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			continue
 		}
-		e.Stars = loadStars(e.Keyword)
-		entries = append(entries, &e)
+		htmlify(e)
+		loadStars(e)
+		ce := e.Copy()
+		entries = append(entries, &ce)
 	}
 	rows.Close()
 
@@ -271,13 +328,14 @@ func keywordByKeywordHandler(w http.ResponseWriter, r *http.Request) {
 		notFound(w)
 		return
 	}
-	e.Stars = loadStars(e.Keyword)
+	htmlify(e)
+	loadStars(e)
 
 	re.HTML(w, http.StatusOK, "keyword", struct {
 		Context context.Context
 		Entry   Entry
 	}{
-		r.Context(), e,
+		r.Context(), e.Copy(),
 	})
 }
 
@@ -309,56 +367,44 @@ func keywordByKeywordDeleteHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
-func htmlify(content string) string {
-	if content == "" {
-		return ""
-	}
-	rows, err := db.Query(`
-		SELECT * FROM entry ORDER BY CHARACTER_LENGTH(keyword) DESC
-	`)
-	panicIf(err)
-	entries := make([]*Entry, 0, 500)
-	for rows.Next() {
-		e := Entry{}
-		err := rows.Scan(&e.ID, &e.AuthorID, &e.Keyword, &e.Description, &e.UpdatedAt, &e.CreatedAt)
-		panicIf(err)
-		entries = append(entries, &e)
-	}
-	rows.Close()
+func htmlify(e *Entry) {
+	v, r1, r2 := getReplacers()
 
-	keywords := make([]string, 0, 500)
-	for _, entry := range entries {
-		keywords = append(keywords, regexp.QuoteMeta(entry.Keyword))
+	e.RLock()
+	hv := e.HtmlVersion
+	e.RUnlock()
+
+	if hv >= v {
+		return
 	}
-	reg := pcre.MustCompile("("+strings.Join(keywords, "|")+")", 0)
-	kw2sha := make(map[string]string)
-	content = reg.ReplaceAllStringFunc(content, func(kw string) string {
-		kw2sha[kw] = "isuda_" + fmt.Sprintf("%x", sha1.Sum([]byte(kw)))
-		return kw2sha[kw]
-	}, 0)
-	content = html.EscapeString(content)
-	for kw, hash := range kw2sha {
-		u, err := url.Parse(baseUrl.String() + "/keyword/" + pathURIEscape(kw))
-		panicIf(err)
-		link := fmt.Sprintf("<a href=\"%s\">%s</a>", u, html.EscapeString(kw))
-		content = strings.Replace(content, hash, link, -1)
+
+	e.Lock()
+	hv = e.HtmlVersion
+	if hv >= v {
+		e.Unlock()
+		return
 	}
-	return strings.Replace(content, "\n", "<br />\n", -1)
+	e.Html = r2.Replace(html.EscapeString(r1.Replace(e.Description)))
+	e.HtmlVersion = v
+	e.Unlock()
 }
 
-func loadStars(keyword string) []*Star {
+func loadStars(e *Entry) {
+	e.Lock()
 	v := url.Values{}
-	v.Set("keyword", keyword)
+	v.Set("keyword", e.Keyword)
 	resp, err := http.Get(fmt.Sprintf("%s/stars", isutarEndpoint) + "?" + v.Encode())
 	panicIf(err)
-	defer resp.Body.Close()
 
 	var data struct {
 		Result []*Star `json:result`
 	}
 	err = json.NewDecoder(resp.Body).Decode(&data)
 	panicIf(err)
-	return data.Result
+	resp.Body.Close()
+
+	e.Stars = data.Result
+	e.Unlock()
 }
 
 func isSpamContents(content string) bool {
@@ -485,6 +531,7 @@ func main() {
 }
 
 func populateCache() {
+	return
 	logdbg("populateCache: start")
 	rows, err := db.Query("SELECT keyword FROM entry")
 	if err != nil && err != sql.ErrNoRows {
@@ -512,15 +559,7 @@ func NewEntryCache() *EntryCache {
 	}
 }
 
-func loadEntry(keyword string) (Entry, bool) {
-	e, ok := loadEntryPointer(keyword)
-	if !ok {
-		return Entry{}, false
-	}
-	return *e, ok
-}
-
-func loadEntryPointer(keyword string) (*Entry, bool) {
+func loadEntry(keyword string) (*Entry, bool) {
 	entryCache.mtx.RLock()
 	e, ok := entryCache.m[keyword]
 	entryCache.mtx.RUnlock()
@@ -544,7 +583,6 @@ func loadEntryPointer(keyword string) (*Entry, bool) {
 		entryCache.mtx.Unlock()
 		return &Entry{}, false
 	}
-	e.Html = htmlify(e.Description)
 
 	entryCache.m[keyword] = e
 	entryCache.mtx.Unlock()
@@ -561,6 +599,7 @@ func dropEntry(keyword string) (bool, error) {
 	delete(entryCache.m, keyword)
 	_, err := db.Exec(`DELETE FROM entry WHERE keyword = ?`, keyword)
 	entryCache.mtx.Unlock()
+	go updateReplacers()
 	return true, err
 }
 
@@ -574,5 +613,6 @@ func insertOrUpdateEntry(userID int, keyword, description string) error {
 	`, userID, keyword, description, userID, keyword, description)
 	delete(entryCache.m, keyword)
 	entryCache.mtx.Unlock()
+	go updateReplacers()
 	return err
 }

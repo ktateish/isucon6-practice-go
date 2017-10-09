@@ -7,18 +7,18 @@ import (
 )
 
 type Entry struct {
-	ID          int
+	ID          int // const
 	AuthorID    int
-	Keyword     string
+	Keyword     string // const
 	Description string
 	UpdatedAt   time.Time
-	CreatedAt   time.Time
+	CreatedAt   time.Time // const
 
 	Html  string
 	Stars []*Star
 
-	Mutex           *sync.RWMutex
-	MatchedKeywords []string
+	Mutex       *sync.RWMutex
+	HtmlVersion int64
 }
 
 func (e *Entry) RLock() {
@@ -35,6 +35,14 @@ func (e *Entry) Lock() {
 
 func (e *Entry) Unlock() {
 	e.Mutex.Unlock()
+}
+
+func (e *Entry) Copy() Entry {
+	e.RLock()
+	ce := *e
+	e.RUnlock()
+	ce.Mutex = &sync.RWMutex{}
+	return ce
 }
 
 type User struct {
