@@ -51,7 +51,8 @@ func myHandler(fn func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
 				http.Error(w, http.StatusText(500), 500)
 			}
 		}()
-		debugHandler(fn)(w, r)
+		//debugHandler(fn)(w, r)
+		prepareHandler(fn)(w, r)
 	}
 }
 
