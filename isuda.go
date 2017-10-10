@@ -37,6 +37,11 @@ var (
 	replver    int64
 	replmtx    *sync.RWMutex
 
+	lastID    int
+	lastIDmux *sync.Mutex
+
+	cachePopulated bool
+
 	isutarEndpoint string
 	isupamEndpoint string
 
@@ -87,6 +92,7 @@ func updateReplacers() {
 	repl1 = strings.NewReplacer(rule1...)
 	repl2 = strings.NewReplacer(rule2...)
 	replmtx.Unlock()
+	go refreshCacheForTop()
 }
 
 func initializeReplacers() {
@@ -101,6 +107,7 @@ func initializeReplacers() {
 func init() {
 	entryCache = NewEntryCache()
 	replmtx = &sync.RWMutex{}
+	lastIDmux = &sync.Mutex{}
 }
 
 func setName(w http.ResponseWriter, r *http.Request) error {
@@ -138,8 +145,22 @@ func initializeHandler(w http.ResponseWriter, r *http.Request) {
 	panicIf(err)
 	defer resp.Body.Close()
 
+	initializeReplacers()
 	go populateCache()
-	go initializeReplacers()
+
+	lastIDmux.Lock()
+	rows, err := db.Query(`
+		SELECT keyword FROM entry ORDER BY id DESC LIMIT 1",
+	`)
+	if err != nil && err != sql.ErrNoRows {
+		lastID = 0
+	} else if err != nil {
+		panic(err)
+	} else {
+		err = rows.Scan(&lastID)
+		panicIf(err)
+	}
+	lastIDmux.Unlock()
 
 	re.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
 }
@@ -531,7 +552,10 @@ func main() {
 }
 
 func populateCache() {
-	return
+	if cachePopulated {
+		return
+	}
+	cachePopulated = true
 	logdbg("populateCache: start")
 	rows, err := db.Query("SELECT keyword FROM entry")
 	if err != nil && err != sql.ErrNoRows {
@@ -541,7 +565,11 @@ func populateCache() {
 		var keyword string
 		err := rows.Scan(&keyword)
 		panicIf(err)
-		loadEntry(keyword)
+		e, ok := loadEntry(keyword)
+		if !ok {
+			continue
+		}
+		htmlify(e)
 	}
 	rows.Close()
 	logdbg("populateCache: done")
@@ -605,14 +633,46 @@ func dropEntry(keyword string) (bool, error) {
 
 func insertOrUpdateEntry(userID int, keyword, description string) error {
 	entryCache.mtx.Lock()
-	_, err := db.Exec(`
+	lastIDmux.Lock()
+	res, err := db.Exec(`
 		INSERT INTO entry (author_id, keyword, description, created_at, updated_at)
 		VALUES (?, ?, ?, NOW(), NOW())
 		ON DUPLICATE KEY UPDATE
 		author_id = ?, keyword = ?, description = ?, updated_at = NOW()
 	`, userID, keyword, description, userID, keyword, description)
+	id64, err := res.LastInsertId()
+	panicIf(err)
+	id := int(id64)
+	if id > lastID {
+		go updateReplacers()
+		lastID = id
+	}
+	lastIDmux.Unlock()
 	delete(entryCache.m, keyword)
 	entryCache.mtx.Unlock()
-	go updateReplacers()
 	return err
+}
+
+func refreshCacheForTop() {
+	rows, err := db.Query(
+		"SELECT keyword FROM entry ORDER BY updated_at DESC LIMIT 10",
+	)
+	if err != nil && err != sql.ErrNoRows {
+		panicIf(err)
+	}
+	keywords := []string{}
+	for rows.Next() {
+		var k string
+		err := rows.Scan(&k)
+		panicIf(err)
+		keywords = append(keywords, k)
+	}
+	rows.Close()
+	for _, k := range keywords {
+		e, ok := loadEntry(k)
+		if !ok {
+			continue
+		}
+		htmlify(e)
+	}
 }
