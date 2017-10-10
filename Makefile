@@ -1,4 +1,4 @@
-all: isuda isutar exp
+all: isuda exp
 
 deps:
 	go get github.com/go-sql-driver/mysql
@@ -22,6 +22,6 @@ restart-isuda: isuda
 restart-isutar: isutar
 	sudo systemctl restart isutar.go
 
-restart: restart-isuda restart-isutar
+restart: restart-isuda
 
 .PHONY: all deps restart restart-isuda restart-isutar

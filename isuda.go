@@ -46,6 +46,10 @@ var (
 	store   *sessions.CookieStore
 
 	errInvalidUser = errors.New("Invalid User")
+
+	// stars
+	stardb *sql.DB
+	starre *render.Render
 )
 
 func getReplacers() (int64, *strings.Replacer, *strings.Replacer) {
@@ -134,14 +138,13 @@ func initializeHandler(w http.ResponseWriter, r *http.Request) {
 	_, err := db.Exec(`DELETE FROM entry WHERE id > 7101`)
 	panicIf(err)
 
-	resp, err := http.Get(fmt.Sprintf("%s/initialize", isutarEndpoint))
-	panicIf(err)
-	defer resp.Body.Close()
-
 	go populateCache()
 	go initializeReplacers()
 
 	re.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
+	_, err = stardb.Exec("TRUNCATE star")
+	panicIf(err)
+	starre.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
 }
 
 func topHandler(w http.ResponseWriter, r *http.Request) {
@@ -391,19 +394,7 @@ func htmlify(e *Entry) {
 
 func loadStars(e *Entry) {
 	e.Lock()
-	v := url.Values{}
-	v.Set("keyword", e.Keyword)
-	resp, err := http.Get(fmt.Sprintf("%s/stars", isutarEndpoint) + "?" + v.Encode())
-	panicIf(err)
-
-	var data struct {
-		Result []*Star `json:result`
-	}
-	err = json.NewDecoder(resp.Body).Decode(&data)
-	panicIf(err)
-	resp.Body.Close()
-
-	e.Stars = data.Result
+	e.Stars = readStars(e.Keyword)
 	e.Unlock()
 }
 
@@ -441,6 +432,8 @@ func getSession(w http.ResponseWriter, r *http.Request) *sessions.Session {
 }
 
 func main() {
+	starMain()
+
 	host := os.Getenv("ISUDA_DB_HOST")
 	if host == "" {
 		host = "localhost"
@@ -525,6 +518,10 @@ func main() {
 	k := r.PathPrefix("/keyword/{keyword}").Subrouter()
 	k.Methods("GET").HandlerFunc(myHandler(keywordByKeywordHandler))
 	k.Methods("POST").HandlerFunc(myHandler(keywordByKeywordDeleteHandler))
+
+	s := r.PathPrefix("/stars").Subrouter()
+	s.Methods("GET").HandlerFunc(myHandler(starsHandler))
+	s.Methods("POST").HandlerFunc(myHandler(starsPostHandler))
 
 	r.PathPrefix("/").Handler(http.FileServer(http.Dir("./public/")))
 	log.Fatal(http.ListenAndServe(":5000", r))
@@ -615,4 +612,84 @@ func insertOrUpdateEntry(userID int, keyword, description string) error {
 	entryCache.mtx.Unlock()
 	go updateReplacers()
 	return err
+}
+
+func readStars(keyword string) []*Star {
+	rows, err := stardb.Query(`SELECT * FROM star WHERE keyword = ?`, keyword)
+	if err != nil && err != sql.ErrNoRows {
+		panicIf(err)
+	}
+
+	stars := make([]*Star, 0, 10)
+	for rows.Next() {
+		s := &Star{}
+		err := rows.Scan(&s.ID, &s.Keyword, &s.UserName, &s.CreatedAt)
+		panicIf(err)
+		stars = append(stars, s)
+	}
+	rows.Close()
+
+	return stars
+}
+
+func starsHandler(w http.ResponseWriter, r *http.Request) {
+	keyword := r.FormValue("keyword")
+
+	stars := readStars(keyword)
+
+	starre.JSON(w, http.StatusOK, map[string][]*Star{
+		"result": stars,
+	})
+}
+
+func starsPostHandler(w http.ResponseWriter, r *http.Request) {
+	keyword := r.FormValue("keyword")
+
+	_, ok := loadEntry(keyword)
+	if !ok {
+		notFound(w)
+		return
+	}
+
+	user := r.FormValue("user")
+	_, err := stardb.Exec(`INSERT INTO star (keyword, user_name, created_at) VALUES (?, ?, NOW())`, keyword, user)
+	panicIf(err)
+
+	starre.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
+}
+
+func starMain() {
+	host := os.Getenv("ISUTAR_DB_HOST")
+	if host == "" {
+		host = "localhost"
+	}
+	portstr := os.Getenv("ISUTAR_DB_PORT")
+	if portstr == "" {
+		portstr = "3306"
+	}
+	port, err := strconv.Atoi(portstr)
+	if err != nil {
+		log.Fatalf("Failed to read DB port number from an environment variable ISUTAR_DB_PORT.\nError: %s", err.Error())
+	}
+	user := os.Getenv("ISUTAR_DB_USER")
+	if user == "" {
+		user = "root"
+	}
+	password := os.Getenv("ISUTAR_DB_PASSWORD")
+	dbname := os.Getenv("ISUTAR_DB_NAME")
+	if dbname == "" {
+		dbname = "isutar"
+	}
+
+	stardb, err = sql.Open("mysql", fmt.Sprintf(
+		"%s:%s@tcp(%s:%d)/%s?loc=Local&parseTime=true",
+		user, password, host, port, dbname,
+	))
+	if err != nil {
+		log.Fatalf("Failed to connect to DB: %s.", err.Error())
+	}
+	stardb.Exec("SET SESSION sql_mode='TRADITIONAL,NO_AUTO_VALUE_ON_ZERO,ONLY_FULL_GROUP_BY'")
+	stardb.Exec("SET NAMES utf8mb4")
+
+	starre = render.New(render.Options{Directory: "dummy"})
 }
