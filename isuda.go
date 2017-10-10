@@ -162,10 +162,9 @@ func initializeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	lastIDmux.Unlock()
 
-	re.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
 	_, err = stardb.Exec("TRUNCATE star")
 	panicIf(err)
-	starre.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
+	re.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
 }
 
 func topHandler(w http.ResponseWriter, r *http.Request) {
