@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Songmu/strrand"
 	_ "github.com/go-sql-driver/mysql"
@@ -53,8 +54,9 @@ var (
 	errInvalidUser = errors.New("Invalid User")
 
 	// stars
-	stardb *sql.DB
-	starre *render.Render
+	stardb    *sql.DB
+	starre    *render.Render
+	starCache *StarCache
 )
 
 func getReplacers() (int64, *strings.Replacer, *strings.Replacer) {
@@ -112,6 +114,7 @@ func init() {
 	entryCache = NewEntryCache()
 	replmtx = &sync.RWMutex{}
 	lastIDmux = &sync.Mutex{}
+	starCache = NewStarCache()
 }
 
 func setName(w http.ResponseWriter, r *http.Request) error {
@@ -197,8 +200,8 @@ func topHandler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		htmlify(e)
-		loadStars(e)
 		ce := e.Copy()
+		ce.Stars = readStars(keyword)
 		entries = append(entries, &ce)
 	}
 	rows.Close()
@@ -352,13 +355,14 @@ func keywordByKeywordHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	htmlify(e)
-	loadStars(e)
+	ce := e.Copy()
+	ce.Stars = readStars(keyword)
 
 	re.HTML(w, http.StatusOK, "keyword", struct {
 		Context context.Context
 		Entry   Entry
 	}{
-		r.Context(), e.Copy(),
+		r.Context(), ce,
 	})
 }
 
@@ -409,12 +413,6 @@ func htmlify(e *Entry) {
 	}
 	e.Html = r2.Replace(html.EscapeString(r1.Replace(e.Description)))
 	e.HtmlVersion = v
-	e.Unlock()
-}
-
-func loadStars(e *Entry) {
-	e.Lock()
-	e.Stars = readStars(e.Keyword)
 	e.Unlock()
 }
 
@@ -583,6 +581,17 @@ func NewEntryCache() *EntryCache {
 	}
 }
 
+func readEntry(keyword string) (*Entry, bool) {
+	row := db.QueryRow(`SELECT * FROM entry WHERE keyword = ?`, keyword)
+	e := &Entry{}
+	e.Mutex = &sync.RWMutex{}
+	err := row.Scan(&e.ID, &e.AuthorID, &e.Keyword, &e.Description, &e.UpdatedAt, &e.CreatedAt)
+	if err == sql.ErrNoRows {
+		return &Entry{}, false
+	}
+	return e, true
+}
+
 func loadEntry(keyword string) (*Entry, bool) {
 	entryCache.mtx.RLock()
 	e, ok := entryCache.m[keyword]
@@ -599,13 +608,10 @@ func loadEntry(keyword string) (*Entry, bool) {
 		return e, ok
 	}
 
-	row := db.QueryRow(`SELECT * FROM entry WHERE keyword = ?`, keyword)
-	e = &Entry{}
-	e.Mutex = &sync.RWMutex{}
-	err := row.Scan(&e.ID, &e.AuthorID, &e.Keyword, &e.Description, &e.UpdatedAt, &e.CreatedAt)
-	if err == sql.ErrNoRows {
+	e, ok = readEntry(keyword)
+	if !ok {
 		entryCache.mtx.Unlock()
-		return &Entry{}, false
+		return e, false
 	}
 
 	entryCache.m[keyword] = e
@@ -629,42 +635,91 @@ func dropEntry(keyword string) (bool, error) {
 
 func insertOrUpdateEntry(userID int, keyword, description string) error {
 	entryCache.mtx.Lock()
+	now := time.Now()
 	lastIDmux.Lock()
 	res, err := db.Exec(`
 		INSERT INTO entry (author_id, keyword, description, created_at, updated_at)
-		VALUES (?, ?, ?, NOW(), NOW())
+		VALUES (?, ?, ?, ?, ?)
 		ON DUPLICATE KEY UPDATE
-		author_id = ?, keyword = ?, description = ?, updated_at = NOW()
-	`, userID, keyword, description, userID, keyword, description)
+		author_id = ?, keyword = ?, description = ?, updated_at = ?
+	`, userID, keyword, description, now, now, userID, keyword, description, now)
+	if err != nil {
+		lastIDmux.Unlock()
+		entryCache.mtx.Unlock()
+		panic(err)
+	}
 	id64, err := res.LastInsertId()
-	panicIf(err)
+	if err != nil {
+		lastIDmux.Unlock()
+		entryCache.mtx.Unlock()
+		panic(err)
+	}
 	id := int(id64)
 	if id > lastID {
+		//logdbg("inserted")
 		go updateReplacers()
 		lastID = id
+	} else {
+		//logdbg("updated")
+		e, ok := entryCache.m[keyword]
+		if ok {
+			e.Lock()
+			e.AuthorID = userID
+			e.Description = description
+			e.Unlock()
+		}
 	}
 	lastIDmux.Unlock()
-	delete(entryCache.m, keyword)
 	entryCache.mtx.Unlock()
 	return err
 }
 
+type StarCache struct {
+	m   map[string][]*Star
+	mtx *sync.RWMutex
+}
+
+func NewStarCache() *StarCache {
+	return &StarCache{
+		m:   make(map[string][]*Star),
+		mtx: &sync.RWMutex{},
+	}
+}
+
 func readStars(keyword string) []*Star {
-	rows, err := stardb.Query(`SELECT * FROM star WHERE keyword = ?`, keyword)
-	if err != nil && err != sql.ErrNoRows {
-		panicIf(err)
+	starCache.mtx.RLock()
+	stars, ok := starCache.m[keyword]
+	starCache.mtx.RUnlock()
+	if !ok {
+		stars = []*Star{}
 	}
-
-	stars := make([]*Star, 0, 10)
-	for rows.Next() {
-		s := &Star{}
-		err := rows.Scan(&s.ID, &s.Keyword, &s.UserName, &s.CreatedAt)
-		panicIf(err)
-		stars = append(stars, s)
-	}
-	rows.Close()
-
 	return stars
+	// stars are always on cache
+}
+
+func storeStar(keyword, user string) {
+	starCache.mtx.Lock()
+
+	now := time.Now()
+	res, err := stardb.Exec(`INSERT INTO star (keyword, user_name, created_at) VALUES (?, ?, ?)`, keyword, user, now)
+	if err != nil {
+		starCache.mtx.Unlock()
+		panic(err)
+	}
+	id64, err := res.LastInsertId()
+	if err != nil {
+		starCache.mtx.Unlock()
+		panic(err)
+	}
+	s := &Star{
+		ID:        int(id64),
+		Keyword:   keyword,
+		UserName:  user,
+		CreatedAt: now,
+	}
+	starCache.m[keyword] = append(starCache.m[keyword], s)
+
+	starCache.mtx.Unlock()
 }
 
 func starsHandler(w http.ResponseWriter, r *http.Request) {
@@ -687,8 +742,7 @@ func starsPostHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	user := r.FormValue("user")
-	_, err := stardb.Exec(`INSERT INTO star (keyword, user_name, created_at) VALUES (?, ?, NOW())`, keyword, user)
-	panicIf(err)
+	storeStar(keyword, user)
 
 	starre.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
 }
