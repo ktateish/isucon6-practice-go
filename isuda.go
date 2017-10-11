@@ -72,13 +72,23 @@ func replacerRules() ([]string, []string) {
 	rows, err := db.Query(`
 		SELECT keyword FROM entry ORDER BY CHARACTER_LENGTH(keyword) DESC
 	`)
-	panicIf(err)
-	rule1 := make([]string, 0, 500)
-	rule2 := make([]string, 0, 500)
+	if err != nil && err != sql.ErrNoRows {
+		panic(err)
+	}
+	ks := make([]string, 0, 8000)
 	for rows.Next() {
 		var k string
 		err := rows.Scan(&k)
-		panicIf(err)
+		if err != nil {
+			rows.Close()
+			panic(err)
+		}
+		ks = append(ks, k)
+	}
+	rows.Close()
+	rule1 := make([]string, 0, 16000)
+	rule2 := make([]string, 0, 16000)
+	for _, k := range ks {
 		sha := "isuda_" + fmt.Sprintf("%x", sha1.Sum([]byte(k)))
 		u, err := url.Parse(baseUrl.String() + "/keyword/" + pathURIEscape(k))
 		panicIf(err)
@@ -87,7 +97,6 @@ func replacerRules() ([]string, []string) {
 		rule2 = append(rule2, sha, link)
 	}
 	rule2 = append(rule2, "\n", "<br />\n")
-	rows.Close()
 	return rule1, rule2
 }
 
@@ -152,17 +161,11 @@ func initializeHandler(w http.ResponseWriter, r *http.Request) {
 	go populateCache()
 
 	lastIDmux.Lock()
-	rows, err := db.Query(`
-		SELECT keyword FROM entry ORDER BY id DESC LIMIT 1",
+	row := db.QueryRow(`
+		SELECT id FROM entry ORDER BY id DESC LIMIT 1
 	`)
-	if err != nil && err != sql.ErrNoRows {
-		lastID = 0
-	} else if err != nil {
-		panic(err)
-	} else {
-		err = rows.Scan(&lastID)
-		panicIf(err)
-	}
+	err = row.Scan(&lastID)
+	panicIf(err)
 	lastIDmux.Unlock()
 
 	_, err = stardb.Exec("TRUNCATE star")
@@ -188,23 +191,31 @@ func topHandler(w http.ResponseWriter, r *http.Request) {
 		perPage, perPage*(page-1),
 	))
 	if err != nil && err != sql.ErrNoRows {
-		panicIf(err)
+		panic(err)
 	}
-	entries := make([]*Entry, 0, 10)
+	ks := make([]string, 0, 10)
 	for rows.Next() {
-		var keyword string
-		err := rows.Scan(&keyword)
-		panicIf(err)
-		e, ok := loadEntry(keyword)
+		var k string
+		err := rows.Scan(&k)
+		if err != nil {
+			rows.Close()
+			panic(err)
+		}
+		ks = append(ks, k)
+	}
+	rows.Close()
+
+	entries := make([]*Entry, 0, 10)
+	for _, k := range ks {
+		e, ok := loadEntry(k)
 		if !ok {
 			continue
 		}
 		htmlify(e)
 		ce := e.Copy()
-		ce.Stars = readStars(keyword)
+		ce.Stars = readStars(k)
 		entries = append(entries, &ce)
 	}
-	rows.Close()
 
 	var totalEntries int
 	row := db.QueryRow(`SELECT COUNT(*) FROM entry`)
@@ -421,13 +432,16 @@ func isSpamContents(content string) bool {
 	v.Set("content", content)
 	resp, err := http.PostForm(isupamEndpoint, v)
 	panicIf(err)
-	defer resp.Body.Close()
 
 	var data struct {
 		Valid bool `json:valid`
 	}
 	err = json.NewDecoder(resp.Body).Decode(&data)
-	panicIf(err)
+	if err != nil {
+		resp.Body.Close()
+		panic(err)
+	}
+	resp.Body.Close()
 	return !data.Valid
 }
 
@@ -553,19 +567,26 @@ func populateCache() {
 	logdbg("populateCache: start")
 	rows, err := db.Query("SELECT keyword FROM entry")
 	if err != nil && err != sql.ErrNoRows {
-		panicIf(err)
+		panic(err)
 	}
+	ks := make([]string, 0, 8000)
 	for rows.Next() {
-		var keyword string
-		err := rows.Scan(&keyword)
-		panicIf(err)
-		e, ok := loadEntry(keyword)
+		var k string
+		err := rows.Scan(&k)
+		if err != nil {
+			rows.Close()
+			panic(k)
+		}
+		ks = append(ks, k)
+	}
+	rows.Close()
+	for _, k := range ks {
+		e, ok := loadEntry(k)
 		if !ok {
 			continue
 		}
 		htmlify(e)
 	}
-	rows.Close()
 	logdbg("populateCache: done")
 }
 
@@ -788,17 +809,20 @@ func refreshCacheForTop() {
 		"SELECT keyword FROM entry ORDER BY updated_at DESC LIMIT 10",
 	)
 	if err != nil && err != sql.ErrNoRows {
-		panicIf(err)
+		panic(err)
 	}
-	keywords := []string{}
+	ks := make([]string, 0, 10)
 	for rows.Next() {
 		var k string
 		err := rows.Scan(&k)
-		panicIf(err)
-		keywords = append(keywords, k)
+		if err != nil {
+			rows.Close()
+			panic(err)
+		}
+		ks = append(ks, k)
 	}
 	rows.Close()
-	for _, k := range keywords {
+	for _, k := range ks {
 		e, ok := loadEntry(k)
 		if !ok {
 			continue
