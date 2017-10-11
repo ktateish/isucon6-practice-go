@@ -9,11 +9,14 @@ import (
 	"fmt"
 	"html"
 	"html/template"
+	"io/ioutil"
 	"log"
 	"math"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync"
@@ -171,6 +174,42 @@ func initializeHandler(w http.ResponseWriter, r *http.Request) {
 	_, err = stardb.Exec("TRUNCATE star")
 	panicIf(err)
 	re.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
+}
+
+func profileStartHandler(w http.ResponseWriter, r *http.Request) {
+	f, err := ioutil.TempFile(os.TempDir(), getProgName()+".pprof.")
+	if err != nil {
+		panic(err)
+	}
+	pprof.StartCPUProfile(f)
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	go func() {
+		for sig := range c {
+			logdbg("captured %v, stopping profiler and exiting...", sig)
+			pprof.StopCPUProfile()
+			os.Exit(1)
+		}
+	}()
+	re.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
+	logdbg("profile started: %s", f.Name())
+}
+
+func profileStopHandler(w http.ResponseWriter, r *http.Request) {
+	pprof.StopCPUProfile()
+	re.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
+	logdbg("profile stopped")
+}
+
+func dumpMemprofileHandler(w http.ResponseWriter, r *http.Request) {
+	f, err := ioutil.TempFile(os.TempDir(), getProgName()+".memprof.")
+	if err != nil {
+		panic(err)
+	}
+	pprof.WriteHeapProfile(f)
+	f.Close()
+	re.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
+	logdbg("memory profile dumped")
 }
 
 func topHandler(w http.ResponseWriter, r *http.Request) {
@@ -537,6 +576,9 @@ func main() {
 	r.HandleFunc("/initialize", myHandler(initializeHandler)).Methods("GET")
 	r.HandleFunc("/robots.txt", myHandler(robotsHandler))
 	r.HandleFunc("/keyword", myHandler(keywordPostHandler)).Methods("POST")
+	r.HandleFunc("/pprof/start", myHandler(profileStartHandler))
+	r.HandleFunc("/pprof/stop", myHandler(profileStopHandler))
+	r.HandleFunc("/pprof/memory", myHandler(dumpMemprofileHandler))
 
 	l := r.PathPrefix("/login").Subrouter()
 	l.Methods("GET").HandlerFunc(myHandler(loginHandler))

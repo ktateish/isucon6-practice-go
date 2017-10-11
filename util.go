@@ -2,16 +2,13 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	_ "os/signal"
 	"runtime/debug"
-	"runtime/pprof"
 	"strings"
-	"time"
 )
 
 var (
@@ -51,36 +48,12 @@ func myHandler(fn func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
 				http.Error(w, http.StatusText(500), 500)
 			}
 		}()
-		//debugHandler(fn)(w, r)
 		prepareHandler(fn)(w, r)
 	}
 }
 
-func debugHandler(fn func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		f, err := ioutil.TempFile(os.TempDir(), progname+".pprof.")
-		if err != nil {
-			logdbg("%v", err)
-			panic(err)
-		}
-		pprof.StartCPUProfile(f)
-		defer pprof.StopCPUProfile()
-		//defer f.Close()
-		//
-		//c := make(chan os.Signal, 1)
-		//signal.Notify(c, os.Interrupt)
-		//go func() {
-		//	for sig := range c {
-		//		log.Printf("captured %v, stopping profiler and exiting...", sig)
-		//		pprof.StopCPUProfile()
-		//		os.Exit(1)
-		//	}
-		//}()
-		prepareHandler(fn)(w, r)
-		d := time.Since(start)
-		logdbg("%s %v", r.RequestURI, d)
-	}
+func getProgName() string {
+	return progname
 }
 
 func pathURIEscape(s string) string {
