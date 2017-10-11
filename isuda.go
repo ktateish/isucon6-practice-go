@@ -212,6 +212,23 @@ func dumpMemprofileHandler(w http.ResponseWriter, r *http.Request) {
 	logdbg("memory profile dumped")
 }
 
+func cacheSizeHandler(w http.ResponseWriter, r *http.Request) {
+	entryCache.mtx.RLock()
+	n := len(entryCache.m)
+	entryCache.mtx.RUnlock()
+	re.JSON(w, http.StatusOK, map[string]string{
+		"result": "ok",
+		"size":   fmt.Sprintf("%d", n),
+	})
+}
+
+func cacheClearHandler(w http.ResponseWriter, r *http.Request) {
+	entryCache.mtx.Lock()
+	entryCache.m = make(map[string]*Entry)
+	entryCache.mtx.Unlock()
+	re.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
+}
+
 func topHandler(w http.ResponseWriter, r *http.Request) {
 	if err := setName(w, r); err != nil {
 		forbidden(w)
@@ -579,6 +596,8 @@ func main() {
 	r.HandleFunc("/pprof/start", myHandler(profileStartHandler))
 	r.HandleFunc("/pprof/stop", myHandler(profileStopHandler))
 	r.HandleFunc("/pprof/memory", myHandler(dumpMemprofileHandler))
+	r.HandleFunc("/cache/size", myHandler(cacheSizeHandler))
+	r.HandleFunc("/cache/clear", myHandler(cacheClearHandler))
 
 	l := r.PathPrefix("/login").Subrouter()
 	l.Methods("GET").HandlerFunc(myHandler(loginHandler))
