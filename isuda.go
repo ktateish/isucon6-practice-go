@@ -173,6 +173,7 @@ func initializeHandler(w http.ResponseWriter, r *http.Request) {
 
 	_, err = stardb.Exec("TRUNCATE star")
 	panicIf(err)
+	populateStarCache()
 	re.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
 }
 
@@ -772,11 +773,78 @@ func readStars(keyword string) []*Star {
 	starCache.mtx.RLock()
 	stars, ok := starCache.m[keyword]
 	starCache.mtx.RUnlock()
-	if !ok {
-		stars = []*Star{}
+	if ok {
+		return stars
 	}
+	starCache.mtx.Lock()
+	stars, ok = starCache.m[keyword]
+	if ok {
+		starCache.mtx.Unlock()
+		return stars
+	}
+	rows, err := stardb.Query(`SELECT * FROM star WHERE keyword = ?`, keyword)
+	if err != nil && err != sql.ErrNoRows {
+		starCache.mtx.Unlock()
+		panic(err)
+	}
+
+	stars = make([]*Star, 0, 10)
+	for rows.Next() {
+		s := &Star{}
+		err := rows.Scan(&s.ID, &s.Keyword, &s.UserName, &s.CreatedAt)
+		if err != nil {
+			starCache.mtx.Unlock()
+			panic(err)
+		}
+		stars = append(stars, s)
+	}
+	rows.Close()
+	starCache.m[keyword] = stars
+	starCache.mtx.Unlock()
 	return stars
-	// stars are always on cache
+}
+
+func populateStarCache() {
+	starCache.mtx.Lock()
+	erows, err := db.Query(`SELECT keyword FROM entry`)
+	if err != nil && err != sql.ErrNoRows {
+		starCache.mtx.Unlock()
+		panic(err)
+	}
+	ks := make([]string, 0, 8000)
+	for erows.Next() {
+		var k string
+		err := erows.Scan(&k)
+		if err != nil {
+			starCache.mtx.Unlock()
+			panic(err)
+		}
+		ks = append(ks, k)
+	}
+	erows.Close()
+
+	starCache.m = make(map[string][]*Star)
+	for _, k := range ks {
+		rows, err := stardb.Query(`SELECT * FROM star WHERE keyword = ?`, k)
+		if err != nil && err != sql.ErrNoRows {
+			starCache.mtx.Unlock()
+			panic(err)
+		}
+
+		stars := make([]*Star, 0, 10)
+		for rows.Next() {
+			s := &Star{}
+			err := rows.Scan(&s.ID, &s.Keyword, &s.UserName, &s.CreatedAt)
+			if err != nil {
+				starCache.mtx.Unlock()
+				panic(err)
+			}
+			stars = append(stars, s)
+		}
+		starCache.m[k] = stars
+		rows.Close()
+	}
+	starCache.mtx.Unlock()
 }
 
 func storeStar(keyword, user string) {
