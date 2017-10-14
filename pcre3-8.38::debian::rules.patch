@@ -1,0 +1,12 @@
+diff --git a/debian/rules b/debian/rules
+index 7e53492..24ed8c3 100755
+--- a/debian/rules
++++ b/debian/rules
+@@ -38,6 +38,7 @@ configure-stamp:
+                --libdir=\$${prefix}/lib/$(DEB_HOST_MULTIARCH) \
+                --enable-utf8 --enable-unicode-properties \
+                --disable-silent-rules \
++               --with-link-size=3 \
+                $(ENABLE_JIT) \
+                --enable-pcre16 \
+                --enable-pcre32 \

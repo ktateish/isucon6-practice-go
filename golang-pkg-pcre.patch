@@ -1,0 +1,24 @@
+diff --git a/src/pkg/pcre/pcre.go b/src/pkg/pcre/pcre.go
+index 1b357df..532be55 100644
+--- a/src/pkg/pcre/pcre.go
++++ b/src/pkg/pcre/pcre.go
+@@ -392,6 +392,19 @@ func (re Regexp) ReplaceAll(bytes, repl []byte, flags int) []byte {
+ 	return append(r, bytes...)
+ }
+ 
++func (re Regexp) ReplaceAllStringFunc(src string, repl func(string) string, flags int) string {
++	bytes := []byte(src)
++	m := re.Matcher(bytes, 0)
++	r := []byte{}
++	for m.Match(bytes, flags) {
++		r = append(r, bytes[:m.ovector[0]]...)
++		replacing := []byte(repl(string(bytes[m.ovector[0]:m.ovector[1]])))
++		r = append(r, replacing...)
++		bytes = bytes[m.ovector[1]:]
++	}
++	return string(append(r, bytes...))
++}
++
+ // A compilation error, as returned by the Compile function.  The
+ // offset is the byte position in the pattern string at which the
+ // error was detected.
