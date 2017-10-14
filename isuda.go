@@ -157,11 +157,28 @@ func authenticate(w http.ResponseWriter, r *http.Request) error {
 }
 
 func initializeHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(context.TODO(), 4*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go doInitialize(done)
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+	err := ctx.Err()
+	if err != nil {
+		// report if timed out
+		logdbg("initializeHandler: %s", err)
+	}
+	re.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
+}
+
+func doInitialize(done chan struct{}) {
 	_, err := db.Exec(`DELETE FROM entry WHERE id > 7101`)
 	panicIf(err)
 
 	initializeReplacers()
-	go populateCache()
+	populateCache()
 
 	lastIDmux.Lock()
 	row := db.QueryRow(`
@@ -174,7 +191,7 @@ func initializeHandler(w http.ResponseWriter, r *http.Request) {
 	_, err = stardb.Exec("TRUNCATE star")
 	panicIf(err)
 	populateStarCache()
-	re.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
+	close(done)
 }
 
 func profileStartHandler(w http.ResponseWriter, r *http.Request) {
@@ -622,33 +639,29 @@ func main() {
 }
 
 func populateCache() {
-	if cachePopulated {
-		return
-	}
-	cachePopulated = true
 	logdbg("populateCache: start")
-	rows, err := db.Query("SELECT keyword FROM entry")
+	rows, err := db.Query("SELECT * FROM entry")
 	if err != nil && err != sql.ErrNoRows {
 		panic(err)
 	}
-	ks := make([]string, 0, 8000)
+	es := make([]*Entry, 0, 8000)
 	for rows.Next() {
-		var k string
-		err := rows.Scan(&k)
+		e := &Entry{Mutex: &sync.RWMutex{}, HtmlVersion: -1}
+		err := rows.Scan(&e.ID, &e.AuthorID, &e.Keyword, &e.Description, &e.UpdatedAt, &e.CreatedAt)
 		if err != nil {
 			rows.Close()
-			panic(k)
+			panic(err)
 		}
-		ks = append(ks, k)
+		es = append(es, e)
 	}
 	rows.Close()
-	for _, k := range ks {
-		e, ok := loadEntry(k)
-		if !ok {
-			continue
-		}
+	entryCache.mtx.Lock()
+	entryCache.m = make(map[string]*Entry)
+	for _, e := range es {
+		entryCache.m[e.Keyword] = e
 		htmlify(e)
 	}
+	entryCache.mtx.Unlock()
 	logdbg("populateCache: done")
 }
 
