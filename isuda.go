@@ -60,7 +60,93 @@ var (
 	stardb    *sql.DB
 	starre    *render.Render
 	starCache *StarCache
+
+	// link cache
+	linkCache *LinkCache
 )
+
+type LinkCache struct {
+	m   map[string][2]string
+	mtx *sync.Mutex
+}
+
+func NewLinkCache() *LinkCache {
+	return &LinkCache{
+		m:   make(map[string][2]string),
+		mtx: &sync.Mutex{},
+	}
+}
+
+/*
+func getLink(k string) (string, string) {
+	linkCache.mtx.RLock()
+	v, ok := linkCache.m[k]
+	linkCache.mtx.RUnlock()
+	if ok {
+		return v[0], v[1]
+	}
+	linkCache.mtx.Lock()
+	v, ok = linkCache.m[k]
+	if ok {
+		linkCache.mtx.Unlock()
+		return v[0], v[1]
+	}
+	sha := "isuda_" + fmt.Sprintf("%x", sha1.Sum([]byte(k)))
+	u, err := url.Parse(baseUrl.String() + "/keyword/" + pathURIEscape(k))
+	if err != nil {
+		linkCache.mtx.Unlock()
+		panic(err)
+	}
+	link := fmt.Sprintf("<a href=\"%s\">%s</a>", u, html.EscapeString(k))
+	linkCache.m[k] = [2]string{sha, link}
+	linkCache.mtx.Unlock()
+	return sha, link
+}
+*/
+
+func getLinkDanger(k string) (string, string, error) {
+	v, ok := linkCache.m[k]
+	if ok {
+		return v[0], v[1], nil
+	}
+	sha := "isuda_" + fmt.Sprintf("%x", sha1.Sum([]byte(k)))
+	u, err := url.Parse(baseUrl.String() + "/keyword/" + pathURIEscape(k))
+	if err != nil {
+		return "", "", err
+	}
+	link := fmt.Sprintf("<a href=\"%s\">%s</a>", u, html.EscapeString(k))
+	linkCache.m[k] = [2]string{sha, link}
+	return sha, link, nil
+}
+
+func populateLinkCache() {
+	linkCache.mtx.Lock()
+	rows, err := db.Query(`SELECT keywrod FROM entry`)
+	if err != nil && err != sql.ErrNoRows {
+		linkCache.mtx.Unlock()
+		panic(err)
+	}
+	ks := make([]string, 0, 8000)
+	for rows.Next() {
+		var k string
+		err := rows.Scan(&k)
+		if err != nil {
+			linkCache.mtx.Unlock()
+			panic(err)
+		}
+		ks = append(ks, k)
+	}
+	rows.Close()
+
+	for _, k := range ks {
+		_, _, err := getLinkDanger(k)
+		if err != nil {
+			linkCache.mtx.Unlock()
+			panic(err)
+		}
+	}
+	linkCache.mtx.Unlock()
+}
 
 func getReplacers() (int64, *strings.Replacer, *strings.Replacer) {
 	replmtx.RLock()
@@ -91,14 +177,17 @@ func replacerRules() ([]string, []string) {
 	rows.Close()
 	rule1 := make([]string, 0, 16000)
 	rule2 := make([]string, 0, 16000)
+	linkCache.mtx.Lock()
 	for _, k := range ks {
-		sha := "isuda_" + fmt.Sprintf("%x", sha1.Sum([]byte(k)))
-		u, err := url.Parse(baseUrl.String() + "/keyword/" + pathURIEscape(k))
-		panicIf(err)
-		link := fmt.Sprintf("<a href=\"%s\">%s</a>", u, html.EscapeString(k))
+		sha, link, err := getLinkDanger(k)
+		if err != nil {
+			linkCache.mtx.Unlock()
+			panic(err)
+		}
 		rule1 = append(rule1, k, sha)
 		rule2 = append(rule2, sha, link)
 	}
+	linkCache.mtx.Unlock()
 	rule2 = append(rule2, "\n", "<br />\n")
 	return rule1, rule2
 }
@@ -127,6 +216,7 @@ func init() {
 	replmtx = &sync.RWMutex{}
 	lastIDmux = &sync.Mutex{}
 	starCache = NewStarCache()
+	linkCache = NewLinkCache()
 }
 
 func setName(w http.ResponseWriter, r *http.Request) error {
@@ -176,6 +266,8 @@ func initializeHandler(w http.ResponseWriter, r *http.Request) {
 func doInitialize(done chan struct{}) {
 	_, err := db.Exec(`DELETE FROM entry WHERE id > 7101`)
 	panicIf(err)
+
+	//populateLinkCache()
 
 	initializeReplacers()
 	populateCache()
